@@ -21,15 +21,16 @@ Each line in `HideHIDDevices.ini` is a Hardware ID as shown in Device Manager (d
 
 ### Hiding everything that isn't a game controller
 
-`HideNonGameControllers=1` (the default) also hides every HID device that DirectInput doesn't report as a game controller: extra HID mice and keyboards, RGB/lighting controllers, coolers, media keys and vendor-defined devices. The game still gets the mouse and keyboard through Windows' combined system *Mouse* and *Keyboard* devices, and joysticks, gamepads and wheels stay visible.
+`HideNonGameControllers=1` (off by default) also hides every HID device that DirectInput doesn't report as a game controller: extra HID mice and keyboards, RGB/lighting controllers, coolers, media keys and vendor-defined devices. The game still gets the mouse and keyboard through Windows' combined system *Mouse* and *Keyboard* devices, and joysticks, gamepads and wheels stay visible.
 
-Gaming mice and keyboards often expose several HID devices each. Hot Pursuit 2 can crash at random when DirectInput reports too many devices, so this option is on by default. Set `HideNonGameControllers=0` to hide only the devices listed in the `.ini`.
+Gaming mice and keyboards often expose several HID devices each. Turn this on if a game has trouble with the number of devices DirectInput reports. These devices are hidden from the game only; DirectInput itself still reads them.
 
 ## How it works
 
 - On load, the plugin redirects the game's calls to `DirectInputCreateA/W/Ex` (`dinput.dll`), `DirectInput8Create` (`dinput8.dll`) and `GetProcAddress` through itself.
 - When the game creates a DirectInput object, the plugin reads the `.ini` and patches the object's `EnumDevices`, `CreateDevice`, `CreateDeviceEx` and `GetDeviceStatus` methods.
 - Matching devices are skipped during enumeration, and attempts to open them fail with `DIERR_DEVICENOTREG`.
+- Devices listed in the `.ini` are also hidden from DirectInput itself. Some devices, such as the ASRock LED controller, make Windows' `dinput.dll` corrupt memory while it reads them during enumeration, even if the game never uses them, which causes random crashes. The plugin therefore patches the system `dinput.dll`'s own imports, so its SetupAPI device enumeration (`SetupDiEnumDeviceInterfaces`) skips these devices and opening them (`CreateFile`) fails.
 
 DirectInput only exposes a device's VID/PID, so that is what decides what gets hidden. The `REV`/`MI`/`Col` parts are checked against the devices Windows reports as connected.
 

@@ -39,7 +39,7 @@
 #pragma comment(lib, "setupapi.lib")
 #endif
 
-#define HHD_VERSION "1.3.0"
+#define HHD_VERSION "1.4.0"
 
 /* ------------------------------------------------------------------------- */
 /* DirectInput bits we need (defined locally so no SDK/dxguid is required)    */
@@ -99,7 +99,7 @@ typedef struct { WORD vid, pid; char entry[256]; } HiddenId;
 #define MAX_HIDDEN 64
 static HiddenId g_hidden[MAX_HIDDEN];
 static int g_hiddenCount;
-static BOOL g_hideNonGameControllers = TRUE;
+static BOOL g_hideNonGameControllers = FALSE;
 static volatile LONG g_initDone;
 
 #define MAX_GUIDS 128
@@ -435,6 +435,8 @@ static void LogModules(void)
     CloseHandle(snap);
 }
 
+static void HookSystemDInput(void);
+
 static void EnsureInit(void)
 {
     if (g_initDone) return;
@@ -443,6 +445,7 @@ static void EnsureInit(void)
         LogHeapSummary("before plugin setup");
         LogConnectedHidDevices();
         LoadIni();
+        HookSystemDInput();
         InterlockedExchange(&g_initDone, 1);
     }
     LeaveCriticalSection(&g_cs);
@@ -931,6 +934,190 @@ static void HookImports(HMODULE mod)
                 }
             }
         }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Hiding devices from DirectInput itself                                    */
+/*                                                                           */
+/* DirectInput reads every HID device while enumerating, even ones we later  */
+/* hide from the game, and some devices (e.g. the ASRock LED controller)     */
+/* make it corrupt the heap. So we also patch the system dinput.dll's own    */
+/* imports: SetupAPI enumeration skips hidden devices and opening them fails.*/
+/* ------------------------------------------------------------------------- */
+
+static BOOL PathIsHiddenA(const char *path)
+{
+    char low[1024], key[32];
+    size_t k;
+    int i;
+    if (!path) return FALSE;
+    for (k = 0; path[k] && k < sizeof(low) - 1; k++) low[k] = (char)tolower((unsigned char)path[k]);
+    low[k] = 0;
+    for (i = 0; i < g_hiddenCount; i++) {
+        _snprintf(key, sizeof(key), "vid_%04x&pid_%04x", g_hidden[i].vid, g_hidden[i].pid);
+        key[sizeof(key) - 1] = 0;
+        if (strstr(low, key)) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL PathIsHiddenW(const WCHAR *path)
+{
+    char a[1024];
+    if (!path) return FALSE;
+    if (!WideCharToMultiByte(CP_ACP, 0, path, -1, a, sizeof(a), NULL, NULL)) return FALSE;
+    a[sizeof(a) - 1] = 0;
+    return PathIsHiddenA(a);
+}
+
+static void LogBlocked(const char *what, const char *path)
+{
+    static LONG n;
+    if (InterlockedIncrement(&n) <= 20) Log("DirectInput internals: %s %s", what, path);
+}
+
+static BOOL InterfaceIsHidden(HDEVINFO set, PSP_DEVICE_INTERFACE_DATA ifd)
+{
+    union { SP_DEVICE_INTERFACE_DETAIL_DATA_W d; BYTE raw[2048]; } buf;
+    char a[1024];
+    memset(&buf, 0, sizeof(buf));
+    buf.d.cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+    if (!SetupDiGetDeviceInterfaceDetailW(set, ifd, &buf.d, sizeof(buf), NULL, NULL)) return FALSE;
+    if (!PathIsHiddenW(buf.d.DevicePath)) return FALSE;
+    WideCharToMultiByte(CP_ACP, 0, buf.d.DevicePath, -1, a, sizeof(a), NULL, NULL);
+    a[sizeof(a) - 1] = 0;
+    LogBlocked("skipped device", a);
+    return TRUE;
+}
+
+static BOOL WINAPI Hk_SetupDiEnumDeviceInterfaces(HDEVINFO set, PSP_DEVINFO_DATA dev,
+                                                  const GUID *cls, DWORD index,
+                                                  PSP_DEVICE_INTERFACE_DATA out)
+{
+    DWORD j, visible = 0;
+    if (g_hiddenCount == 0 || !out)
+        return SetupDiEnumDeviceInterfaces(set, dev, cls, index, out);
+    for (j = 0; ; j++) {
+        if (!SetupDiEnumDeviceInterfaces(set, dev, cls, j, out)) return FALSE;
+        if (InterfaceIsHidden(set, out)) continue;
+        if (visible == index) return TRUE;
+        visible++;
+    }
+}
+
+static HANDLE WINAPI Hk_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                                    DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if (PathIsHiddenW(name)) {
+        char a[1024];
+        WideCharToMultiByte(CP_ACP, 0, name, -1, a, sizeof(a), NULL, NULL);
+        a[sizeof(a) - 1] = 0;
+        LogBlocked("blocked opening", a);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return CreateFileW(name, access, share, sa, disp, flags, tmpl);
+}
+
+static HANDLE WINAPI Hk_CreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                                    DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if (PathIsHiddenA(name)) {
+        LogBlocked("blocked opening", name);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return CreateFileA(name, access, share, sa, disp, flags, tmpl);
+}
+
+typedef struct { const char *fn; void *hook; } NamedHook;
+static const NamedHook g_dinputHooks[] = {
+    { "SetupDiEnumDeviceInterfaces", (void *)Hk_SetupDiEnumDeviceInterfaces },
+    { "CreateFileW",                 (void *)Hk_CreateFileW },
+    { "CreateFileA",                 (void *)Hk_CreateFileA },
+};
+#define DINPUT_HOOK_COUNT (sizeof(g_dinputHooks) / sizeof(g_dinputHooks[0]))
+
+static int PatchThunks(BYTE *base, IMAGE_THUNK_DATA *iat, IMAGE_THUNK_DATA *names,
+                       const char *dllName, const char *modName)
+{
+    int i, patched = 0;
+    size_t h;
+    if (!names) return 0;
+    for (i = 0; names[i].u1.AddressOfData; i++) {
+        const char *fn;
+        if (IMAGE_SNAP_BY_ORDINAL(names[i].u1.Ordinal)) continue;
+        fn = (const char *)((IMAGE_IMPORT_BY_NAME *)(base + names[i].u1.AddressOfData))->Name;
+        for (h = 0; h < DINPUT_HOOK_COUNT; h++) {
+            DWORD old;
+            if (strcmp(fn, g_dinputHooks[h].fn)) continue;
+            if (VirtualProtect(&iat[i].u1.Function, sizeof(void *), PAGE_READWRITE, &old)) {
+                iat[i].u1.Function = (DWORD_PTR)g_dinputHooks[h].hook;
+                VirtualProtect(&iat[i].u1.Function, sizeof(void *), old, &old);
+                Log("Hooked %s import %s!%s", modName, dllName, fn);
+                patched++;
+            }
+        }
+    }
+    return patched;
+}
+
+typedef struct {
+    DWORD Attributes, DllNameRVA, ModuleHandleRVA, ImportAddressTableRVA,
+          ImportNameTableRVA, BoundImportAddressTableRVA, UnloadInformationTableRVA, TimeDateStamp;
+} DelayDesc;
+
+static int HookModuleImports(HMODULE mod, const char *modName)
+{
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    int patched = 0;
+
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir->VirtualAddress) {
+        IMAGE_IMPORT_DESCRIPTOR *d;
+        for (d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress); d->Name; d++)
+            patched += PatchThunks(base, (IMAGE_THUNK_DATA *)(base + d->FirstThunk),
+                                   d->OriginalFirstThunk ? (IMAGE_THUNK_DATA *)(base + d->OriginalFirstThunk) : NULL,
+                                   (const char *)(base + d->Name), modName);
+    }
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (dir->VirtualAddress) {
+        DelayDesc *d;
+        for (d = (DelayDesc *)(base + dir->VirtualAddress); d->DllNameRVA; d++) {
+            if (!(d->Attributes & 1)) continue;   /* only RVA-based descriptors */
+            patched += PatchThunks(base, (IMAGE_THUNK_DATA *)(base + d->ImportAddressTableRVA),
+                                   (IMAGE_THUNK_DATA *)(base + d->ImportNameTableRVA),
+                                   (const char *)(base + d->DllNameRVA), modName);
+        }
+    }
+    return patched;
+}
+
+static void HookSystemDInput(void)
+{
+    static const char *dlls[] = { "dinput.dll", "dinput8.dll" };
+    char sys[MAX_PATH], path[MAX_PATH];
+    size_t i;
+    if (g_hiddenCount == 0) return;
+    if (!GetSystemDirectoryA(sys, MAX_PATH)) return;
+    for (i = 0; i < sizeof(dlls) / sizeof(dlls[0]); i++) {
+        HMODULE m;
+        int n;
+        _snprintf(path, MAX_PATH, "%s\\%s", sys, dlls[i]);
+        path[MAX_PATH - 1] = 0;
+        /* only touch dinput8 if the game already uses it */
+        m = (i == 0) ? LoadLibraryA(path) : GetModuleHandleA(path);
+        if (!m) continue;
+        n = HookModuleImports(m, dlls[i]);
+        if (n == 0) Log("Warning: found nothing to hook in %s", path);
     }
 }
 
