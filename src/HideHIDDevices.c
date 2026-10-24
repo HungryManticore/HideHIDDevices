@@ -38,6 +38,8 @@
 #pragma comment(lib, "setupapi.lib")
 #endif
 
+#define HHD_VERSION "1.1.0"
+
 /* ------------------------------------------------------------------------- */
 /* DirectInput bits we need (defined locally so no SDK/dxguid is required)    */
 /* ------------------------------------------------------------------------- */
@@ -66,6 +68,8 @@ enum { DEVSLOT_RELEASE = 2, DEVSLOT_GETDEVICEINFO = 15 };
 #define DDI_OFS_INSTNAME     40
 #define DDI_SIZE_DX3_A      (40 + 260 * 2)
 #define DDI_SIZE_DX3_W      (40 + 260 * 2 * 2)
+#define DDI_SIZE_DX5_A      (DDI_SIZE_DX3_A + 20)   /* + guidFFDriver, wUsagePage, wUsage */
+#define DDI_SIZE_DX5_W      (DDI_SIZE_DX3_W + 20)
 
 typedef HRESULT (WINAPI *PFN_DICreateA)(HINSTANCE, DWORD, void **, void *);
 typedef HRESULT (WINAPI *PFN_DICreateEx)(HINSTANCE, DWORD, REFIID, void **, void *);
@@ -325,11 +329,45 @@ static void LoadIni(void)
     Log("INI: %d device ID(s) to hide", g_hiddenCount);
 }
 
+/* Log every connected HID device so that other problem devices can be identified. */
+static void LogConnectedHidDevices(void)
+{
+    HDEVINFO h;
+    SP_DEVINFO_DATA d;
+    DWORD i, type;
+    static char ids[8192];
+    char desc[256];
+
+    h = SetupDiGetClassDevsA(NULL, "HID", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (h == INVALID_HANDLE_VALUE) {
+        Log("Windows HID list: could not be read (error %lu)", (unsigned long)GetLastError());
+        return;
+    }
+    Log("Connected HID devices reported by Windows:");
+    for (i = 0; ; i++) {
+        memset(&d, 0, sizeof(d));
+        d.cbSize = sizeof(d);
+        if (!SetupDiEnumDeviceInfo(h, i, &d)) break;
+        memset(ids, 0, sizeof(ids));
+        desc[0] = 0;
+        if (!SetupDiGetDeviceRegistryPropertyA(h, &d, SPDRP_HARDWAREID, &type,
+                                               (BYTE *)ids, sizeof(ids) - 2, NULL))
+            continue;
+        if (!SetupDiGetDeviceRegistryPropertyA(h, &d, SPDRP_DEVICEDESC, &type,
+                                               (BYTE *)desc, sizeof(desc) - 1, NULL))
+            desc[0] = 0;
+        desc[sizeof(desc) - 1] = 0;
+        Log("  %s  (%s)", ids, desc);
+    }
+    SetupDiDestroyDeviceInfoList(h);
+}
+
 static void EnsureInit(void)
 {
     if (g_initDone) return;
     EnterCriticalSection(&g_cs);
     if (!g_initDone) {
+        LogConnectedHidDevices();
         LoadIni();
         InterlockedExchange(&g_initDone, 1);
     }
@@ -412,12 +450,18 @@ static void DescribeIID(REFIID riid, BOOL *isDI, BOOL *wide, BOOL *has7)
 /* If a freshly created device turns out to be a hidden one, refuse it. */
 static BOOL CreatedDeviceIsHidden(void *dev, BOOL wide)
 {
-    BYTE info[DDI_SIZE_DX3_W + 16];
+    BYTE info[DDI_SIZE_DX5_W + 16];
     void **vt = *(void ***)dev;
+    PFN_GetDeviceInfo getInfo = (PFN_GetDeviceInfo)vt[DEVSLOT_GETDEVICEINFO];
     WORD vid, pid;
+    /* DirectInput 8 only accepts the DX5+ structure size, DirectInput 3 only the DX3 size */
     memset(info, 0, sizeof(info));
-    *(DWORD *)info = wide ? DDI_SIZE_DX3_W : DDI_SIZE_DX3_A;
-    if (FAILED(((PFN_GetDeviceInfo)vt[DEVSLOT_GETDEVICEINFO])(dev, info))) return FALSE;
+    *(DWORD *)info = wide ? DDI_SIZE_DX5_W : DDI_SIZE_DX5_A;
+    if (FAILED(getInfo(dev, info))) {
+        memset(info, 0, sizeof(info));
+        *(DWORD *)info = wide ? DDI_SIZE_DX3_W : DDI_SIZE_DX3_A;
+        if (FAILED(getInfo(dev, info))) return FALSE;
+    }
     if (ProductGuidIsHidden((const GUID *)(info + DDI_OFS_GUIDPRODUCT), &vid, &pid)) {
         EnterCriticalSection(&g_cs);
         AddGuid((const GUID *)(info + DDI_OFS_GUIDINSTANCE), g_hiddenInstances, &g_hiddenInstanceCount);
@@ -490,7 +534,10 @@ static HRESULT WINAPI Hk_EnumDevices(void *self, DWORD type, void *cb, void *ref
 {
     VtblHook *h = FindHook(self);
     EnumCtx ctx;
+    static LONG calls;
     if (!h) return E_FAIL;
+    if (InterlockedIncrement(&calls) <= 20)
+        Log("EnumDevices(type 0x%lX, flags 0x%lX)", (unsigned long)type, (unsigned long)flags);
     if (!cb || g_hiddenCount == 0) return h->oEnumDevices(self, type, cb, ref, flags);
     ctx.cb = (PFN_EnumCallback)cb;
     ctx.ref = ref;
@@ -518,6 +565,10 @@ static HRESULT WINAPI Hk_CreateDevice(void *self, REFGUID rguid, void **out, voi
         Log("CreateDevice %s blocked (hidden device)", gs);
         return DIERR_DEVICENOTREG;
     }
+    if (rguid) {
+        GuidToStr(rguid, gs, sizeof(gs));
+        Log("CreateDevice %s -> 0x%08lX", gs, (unsigned long)hr);
+    }
     return hr;
 }
 
@@ -540,6 +591,10 @@ static HRESULT WINAPI Hk_CreateDeviceEx(void *self, REFGUID rguid, REFIID riid, 
         GuidToStr(rguid, gs, sizeof(gs));
         Log("CreateDeviceEx %s blocked (hidden device)", gs);
         return DIERR_DEVICENOTREG;
+    }
+    if (rguid) {
+        GuidToStr(rguid, gs, sizeof(gs));
+        Log("CreateDeviceEx %s -> 0x%08lX", gs, (unsigned long)hr);
     }
     return hr;
 }
@@ -713,6 +768,16 @@ static void HookImports(HMODULE mod)
         int i;
         BOOL relevant = FALSE;
 
+        /* Report legacy joystick API use - those calls are not filtered. */
+        if (!lstrcmpiA(dllName, "winmm.dll") && names) {
+            for (i = 0; names[i].u1.AddressOfData; i++) {
+                const char *fn;
+                if (IMAGE_SNAP_BY_ORDINAL(names[i].u1.Ordinal)) continue;
+                fn = (const char *)((IMAGE_IMPORT_BY_NAME *)(base + names[i].u1.AddressOfData))->Name;
+                if (!strncmp(fn, "joy", 3)) Log("Note: game imports winmm!%s (not filtered)", fn);
+            }
+        }
+
         for (h = 0; h < IAT_HOOK_COUNT; h++)
             if (!lstrcmpiA(dllName, g_iatHooks[h].dll)) relevant = TRUE;
         if (!relevant) continue;
@@ -743,6 +808,92 @@ static void HookImports(HMODULE mod)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Crash logging                                                             */
+/* ------------------------------------------------------------------------- */
+
+static void DescribeAddress(DWORD_PTR addr, char *out, size_t len)
+{
+    HMODULE m = NULL;
+    char path[MAX_PATH], *name;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &m) && m &&
+        GetModuleFileNameA(m, path, MAX_PATH)) {
+        path[MAX_PATH - 1] = 0;
+        name = strrchr(path, '\\');
+        _snprintf(out, len, "%s+0x%lX", name ? name + 1 : path,
+                  (unsigned long)(addr - (DWORD_PTR)m));
+    } else {
+        _snprintf(out, len, "0x%08lX (no module)", (unsigned long)addr);
+    }
+    out[len - 1] = 0;
+}
+
+static BOOL AddressInCode(DWORD_PTR addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr < 0x10000 || !VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) return FALSE;
+    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+           (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY));
+}
+
+static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
+{
+    static LONG count;
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    CONTEXT *c = ep->ContextRecord;
+    DWORD code = er->ExceptionCode;
+    char where[MAX_PATH + 32];
+    DWORD_PTR *sp;
+    int i, found;
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_PRIV_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000374 /* heap corruption */)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&count) > 5) return EXCEPTION_CONTINUE_SEARCH;
+
+    DescribeAddress((DWORD_PTR)er->ExceptionAddress, where, sizeof(where));
+    Log("*** EXCEPTION 0x%08lX at %s", (unsigned long)code, where);
+    if (code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        Log("    %s address 0x%08lX",
+            er->ExceptionInformation[0] == 0 ? "read from" :
+            er->ExceptionInformation[0] == 1 ? "write to" : "execute at",
+            (unsigned long)er->ExceptionInformation[1]);
+#ifdef _M_IX86
+    Log("    EAX=%08lX EBX=%08lX ECX=%08lX EDX=%08lX ESI=%08lX EDI=%08lX",
+        c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi);
+    Log("    EIP=%08lX ESP=%08lX EBP=%08lX thread %lu",
+        c->Eip, c->Esp, c->Ebp, (unsigned long)GetCurrentThreadId());
+    sp = (DWORD_PTR *)c->Esp;
+#elif defined(__i386__)
+    Log("    EAX=%08lX EBX=%08lX ECX=%08lX EDX=%08lX ESI=%08lX EDI=%08lX",
+        c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi);
+    Log("    EIP=%08lX ESP=%08lX EBP=%08lX thread %lu",
+        c->Eip, c->Esp, c->Ebp, (unsigned long)GetCurrentThreadId());
+    sp = (DWORD_PTR *)c->Esp;
+#else
+    sp = NULL;
+#endif
+    /* Heuristic call stack: code addresses found on the stack. */
+    if (sp && code != EXCEPTION_STACK_OVERFLOW) {
+        Log("    Possible callers (from stack):");
+        DWORD_PTR *top = (DWORD_PTR *)((NT_TIB *)NtCurrentTeb())->StackBase;
+        for (i = 0, found = 0; i < 1024 && found < 20 && sp + i < top; i++) {
+            DWORD_PTR v = sp[i];
+            if (AddressInCode(v)) {
+                DescribeAddress(v, where, sizeof(where));
+                Log("      [ESP+0x%03X] %s", i * 4, where);
+                found++;
+            }
+        }
+    }
+    Log("    (first-chance; the game may still handle this exception)");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ------------------------------------------------------------------------- */
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
@@ -760,8 +911,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         _snprintf(g_iniPath, MAX_PATH, "%s.ini", path); g_iniPath[MAX_PATH - 1] = 0;
         _snprintf(g_logPath, MAX_PATH, "%s.log", path); g_logPath[MAX_PATH - 1] = 0;
 
-        DeleteFileA(g_logPath);
-        Log("HideHIDDevices loaded");
+        /* keep the previous run's log, so a crash log survives the next launch */
+        {
+            char prev[MAX_PATH];
+            _snprintf(prev, MAX_PATH, "%s.prev.log", path); prev[MAX_PATH - 1] = 0;
+            MoveFileExA(g_logPath, prev, MOVEFILE_REPLACE_EXISTING);
+        }
+        Log("HideHIDDevices %s loaded", HHD_VERSION);
+        AddVectoredExceptionHandler(1, CrashLogger);
         HookImports(GetModuleHandleA(NULL));
     }
     return TRUE;
