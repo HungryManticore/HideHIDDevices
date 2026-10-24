@@ -39,7 +39,7 @@
 #pragma comment(lib, "setupapi.lib")
 #endif
 
-#define HHD_VERSION "1.4.0"
+#define HHD_VERSION "1.5.0"
 
 /* ------------------------------------------------------------------------- */
 /* DirectInput bits we need (defined locally so no SDK/dxguid is required)    */
@@ -132,6 +132,8 @@ static PFN_GetProcAddress o_GetProcAddress;
 /* Logging                                                                   */
 /* ------------------------------------------------------------------------- */
 
+static BOOL g_logEnabled = TRUE;
+
 static void Log(const char *fmt, ...)
 {
     char buf[1024];
@@ -141,6 +143,7 @@ static void Log(const char *fmt, ...)
     DWORD written;
     SYSTEMTIME st;
 
+    if (!g_logEnabled) return;
     GetLocalTime(&st);
     n = _snprintf(buf, sizeof(buf) - 3, "[%02u:%02u:%02u.%03u] ",
                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
@@ -245,6 +248,9 @@ static void ProcessIniLine(char *line)
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '"')) *--e = 0;
     if (*s == '"') s++;
     if (!*s || *s == ';' || *s == '#' || *s == '[') return;
+
+    /* EnableLog=0/1 is read early in DllMain */
+    if (!_strnicmp(s, "EnableLog", 9)) return;
 
     /* HideNonGameControllers=0/1 */
     if (!_strnicmp(s, "HideNonGameControllers", 22)) {
@@ -356,6 +362,7 @@ static void LogConnectedHidDevices(void)
     static char ids[8192];
     char desc[256];
 
+    if (!g_logEnabled) return;
     h = SetupDiGetClassDevsA(NULL, "HID", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (h == INVALID_HANDLE_VALUE) {
         Log("Windows HID list: could not be read (error %lu)", (unsigned long)GetLastError());
@@ -395,7 +402,7 @@ static void CheckHeaps(const char *where)
 {
     HANDLE heaps[64];
     DWORD n, i;
-    if (g_heapBadReported || GetCurrentThreadId() != g_mainThread) return;
+    if (!g_logEnabled || g_heapBadReported || GetCurrentThreadId() != g_mainThread) return;
     n = GetProcessHeaps(64, heaps);
     if (n > 64) n = 64;
     g_heapChecks++;
@@ -425,6 +432,7 @@ static void LogModules(void)
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     MODULEENTRY32 me;
     if (snap == INVALID_HANDLE_VALUE) return;
+    if (!g_logEnabled) { CloseHandle(snap); return; }
     Log("Loaded modules:");
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
@@ -1211,6 +1219,43 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
 
 /* ------------------------------------------------------------------------- */
 
+/* Read EnableLog from the .ini before anything is logged (default: on). */
+static BOOL ReadEnableLog(void)
+{
+    HANDLE f;
+    DWORD size, read = 0, i;
+    char *buf, *p;
+    BOOL enabled = TRUE;
+
+    f = CreateFileA(g_iniPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return TRUE;
+    size = GetFileSize(f, NULL);
+    if (size == INVALID_FILE_SIZE || size > 1024 * 1024) { CloseHandle(f); return TRUE; }
+    buf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size + 2);
+    if (!buf) { CloseHandle(f); return TRUE; }
+    ReadFile(f, buf, size, &read, NULL);
+    CloseHandle(f);
+
+    /* tolerate UTF-16 files by dropping zero bytes */
+    for (i = 0, p = buf; i < read; i++) if (buf[i]) *p++ = buf[i];
+    *p = 0;
+
+    for (p = buf; *p; ) {
+        char *line = p, *e;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = 0;
+        while (*line == ' ' || *line == '\t' || (BYTE)*line >= 0x80) line++;
+        if (_strnicmp(line, "EnableLog", 9)) continue;
+        e = strchr(line, '=');
+        if (!e) continue;
+        e++;
+        while (*e == ' ' || *e == '\t') e++;
+        enabled = !(*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F');
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    return enabled;
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -1227,16 +1272,20 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         _snprintf(g_iniPath, MAX_PATH, "%s.ini", path); g_iniPath[MAX_PATH - 1] = 0;
         _snprintf(g_logPath, MAX_PATH, "%s.log", path); g_logPath[MAX_PATH - 1] = 0;
 
+        g_logEnabled = ReadEnableLog();
+        g_mainThread = GetCurrentThreadId();
+
         /* keep the previous run's log, so a crash log survives the next launch */
-        {
+        if (g_logEnabled) {
             char prev[MAX_PATH];
             _snprintf(prev, MAX_PATH, "%s.prev.log", path); prev[MAX_PATH - 1] = 0;
             MoveFileExA(g_logPath, prev, MOVEFILE_REPLACE_EXISTING);
         }
         Log("HideHIDDevices %s loaded", HHD_VERSION);
-        g_mainThread = GetCurrentThreadId();
-        AddVectoredExceptionHandler(1, CrashLogger);
-        LogHeapSummary("at plugin load");
+        if (g_logEnabled) {
+            AddVectoredExceptionHandler(1, CrashLogger);
+            LogHeapSummary("at plugin load");
+        }
         HookImports(GetModuleHandleA(NULL));
     }
     return TRUE;

@@ -36,6 +36,8 @@ DirectInput only exposes a device's VID/PID, so that is what decides what gets h
 
 ## Log file
 
+Logging is on by default; set `EnableLog=0` in the `.ini` to turn it off, along with the diagnostic heap checks and crash logging.
+
 Each launch writes `HideHIDDevices.log` next to the `.asi`, and keeps the previous run's log as `HideHIDDevices.prev.log`. The log contains:
 
 - every HID device Windows reports as connected, with its Hardware ID
