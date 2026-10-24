@@ -19,6 +19,12 @@ Each line in `HideHIDDevices.ini` is a Hardware ID as shown in Device Manager (d
 | `HID\VID_26CE&PID_01A2` | Hides every device with that vendor/product ID |
 | `HID\VID_26CE&PID_01A2&REV_0000` | Hides it only if a connected device has exactly this ID (`REV`, `MI`, `Col` parts must match) |
 
+### Hiding everything that isn't a game controller
+
+`HideNonGameControllers=1` (the default) also hides every HID device that DirectInput doesn't report as a game controller: extra HID mice and keyboards, RGB/lighting controllers, coolers, media keys and vendor-defined devices. The game still gets the mouse and keyboard through Windows' combined system *Mouse* and *Keyboard* devices, and joysticks, gamepads and wheels stay visible.
+
+Gaming mice and keyboards often expose several HID devices each. Hot Pursuit 2 can crash at random when DirectInput reports too many devices, so this option is on by default. Set `HideNonGameControllers=0` to hide only the devices listed in the `.ini`.
+
 ## How it works
 
 - On load, the plugin redirects the game's calls to `DirectInputCreateA/W/Ex` (`dinput.dll`), `DirectInput8Create` (`dinput8.dll`) and `GetProcAddress` through itself.
@@ -29,7 +35,14 @@ DirectInput only exposes a device's VID/PID, so that is what decides what gets h
 
 ## Log file
 
-Each launch writes `HideHIDDevices.log` next to the `.asi`. It lists every device the game enumerated, with its VID/PID, and whether it was hidden. Use it to find the IDs of other devices that cause trouble.
+Each launch writes `HideHIDDevices.log` next to the `.asi`, and keeps the previous run's log as `HideHIDDevices.prev.log`. The log contains:
+
+- every HID device Windows reports as connected, with its Hardware ID
+- every device the game enumerated, with its VID/PID and DirectInput type, and whether it was hidden and why
+- each device the game opened
+- details of any crash: the module and offset where it happened, and likely callers
+
+Use it to find the IDs of other devices that cause trouble.
 
 ## Building
 

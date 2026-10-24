@@ -38,7 +38,7 @@
 #pragma comment(lib, "setupapi.lib")
 #endif
 
-#define HHD_VERSION "1.1.0"
+#define HHD_VERSION "1.2.0"
 
 /* ------------------------------------------------------------------------- */
 /* DirectInput bits we need (defined locally so no SDK/dxguid is required)    */
@@ -65,7 +65,9 @@ enum { DEVSLOT_RELEASE = 2, DEVSLOT_GETDEVICEINFO = 15 };
 /* DIDEVICEINSTANCE layout (A and W share the first 36 bytes) */
 #define DDI_OFS_GUIDINSTANCE  4
 #define DDI_OFS_GUIDPRODUCT  20
+#define DDI_OFS_DEVTYPE      36
 #define DDI_OFS_INSTNAME     40
+#define DIDEVTYPE_HID        0x00010000
 #define DDI_SIZE_DX3_A      (40 + 260 * 2)
 #define DDI_SIZE_DX3_W      (40 + 260 * 2 * 2)
 #define DDI_SIZE_DX5_A      (DDI_SIZE_DX3_A + 20)   /* + guidFFDriver, wUsagePage, wUsage */
@@ -96,6 +98,7 @@ typedef struct { WORD vid, pid; char entry[256]; } HiddenId;
 #define MAX_HIDDEN 64
 static HiddenId g_hidden[MAX_HIDDEN];
 static int g_hiddenCount;
+static BOOL g_hideNonGameControllers = TRUE;
 static volatile LONG g_initDone;
 
 #define MAX_GUIDS 128
@@ -242,6 +245,18 @@ static void ProcessIniLine(char *line)
     if (*s == '"') s++;
     if (!*s || *s == ';' || *s == '#' || *s == '[') return;
 
+    /* HideNonGameControllers=0/1 */
+    if (!_strnicmp(s, "HideNonGameControllers", 22)) {
+        e = strchr(s, '=');
+        if (e) {
+            e++;
+            while (*e == ' ' || *e == '\t') e++;
+            g_hideNonGameControllers = !(*e == '0' || *e == 'n' || *e == 'N' || *e == 'f' || *e == 'F');
+        }
+        Log("INI: HideNonGameControllers = %d", g_hideNonGameControllers);
+        return;
+    }
+
     /* allow "Device1=HID\VID_..." style lines too */
     if ((e = strchr(s, '=')) != NULL) s = e + 1;
     while (*s == ' ' || *s == '\t' || *s == '"') s++;
@@ -327,6 +342,8 @@ static void LoadIni(void)
     }
     HeapFree(GetProcessHeap(), 0, buf);
     Log("INI: %d device ID(s) to hide", g_hiddenCount);
+    Log("INI: HID devices that are not game controllers will be %s",
+        g_hideNonGameControllers ? "hidden (HideNonGameControllers=1)" : "kept (HideNonGameControllers=0)");
 }
 
 /* Log every connected HID device so that other problem devices can be identified. */
@@ -388,6 +405,26 @@ static BOOL ProductGuidIsHidden(const GUID *prod, WORD *vidOut, WORD *pidOut)
     for (i = 0; i < g_hiddenCount; i++)
         if (g_hidden[i].vid == vid && g_hidden[i].pid == pid) return TRUE;
     return FALSE;
+}
+
+/* Why should this DIDEVICEINSTANCE be hidden? NULL = keep it. */
+static const char *HideReason(const BYTE *ddi, WORD *vid, WORD *pid)
+{
+    DWORD type, sub;
+    *vid = *pid = 0;
+    if (ProductGuidIsHidden((const GUID *)(ddi + DDI_OFS_GUIDPRODUCT), vid, pid))
+        return "listed in .ini";
+    if (!g_hideNonGameControllers) return NULL;
+    type = *(const DWORD *)(ddi + DDI_OFS_DEVTYPE);
+    if (!(type & DIDEVTYPE_HID)) return NULL;  /* system mouse/keyboard: always keep */
+    sub = type & 0xFF;
+    /* DirectInput 3-7: 1 device, 2 mouse, 3 keyboard (4 = joystick)
+       DirectInput 8: 0x11 device, 0x12 mouse, 0x13 keyboard, 0x19 device control,
+                      0x1A screen pointer, 0x1B remote (0x14-0x18, 0x1C = game controllers) */
+    if (sub == 1 || sub == 2 || sub == 3 || sub == 0x11 || sub == 0x12 || sub == 0x13 ||
+        sub == 0x19 || sub == 0x1A || sub == 0x1B)
+        return "not a game controller";
+    return NULL;
 }
 
 static BOOL GuidInList(const GUID *g, const GUID *list, int count)
@@ -462,7 +499,7 @@ static BOOL CreatedDeviceIsHidden(void *dev, BOOL wide)
         *(DWORD *)info = wide ? DDI_SIZE_DX3_W : DDI_SIZE_DX3_A;
         if (FAILED(getInfo(dev, info))) return FALSE;
     }
-    if (ProductGuidIsHidden((const GUID *)(info + DDI_OFS_GUIDPRODUCT), &vid, &pid)) {
+    if (HideReason(info, &vid, &pid)) {
         EnterCriticalSection(&g_cs);
         AddGuid((const GUID *)(info + DDI_OFS_GUIDINSTANCE), g_hiddenInstances, &g_hiddenInstanceCount);
         LeaveCriticalSection(&g_cs);
@@ -494,6 +531,7 @@ static BOOL CALLBACK EnumFilter(const void *ddi, void *ref)
     const GUID *inst, *prod;
     WORD vid = 0, pid = 0;
     BOOL hidden, firstTime;
+    const char *reason;
     char name[260], gs[64];
 
     if (!ddi || *(const DWORD *)p < DDI_OFS_GUIDPRODUCT + sizeof(GUID))
@@ -501,7 +539,8 @@ static BOOL CALLBACK EnumFilter(const void *ddi, void *ref)
 
     inst = (const GUID *)(p + DDI_OFS_GUIDINSTANCE);
     prod = (const GUID *)(p + DDI_OFS_GUIDPRODUCT);
-    hidden = ProductGuidIsHidden(prod, &vid, &pid);
+    reason = HideReason(p, &vid, &pid);
+    hidden = reason != NULL;
 
     EnterCriticalSection(&g_cs);
     firstTime = !GuidInList(inst, g_seenInstances, g_seenInstanceCount);
@@ -521,9 +560,13 @@ static BOOL CALLBACK EnumFilter(const void *ddi, void *ref)
         }
         GuidToStr(prod, gs, sizeof(gs));
         if (vid || pid)
-            Log("Enum: \"%s\" VID_%04X&PID_%04X -> %s", name, vid, pid, hidden ? "HIDDEN" : "visible");
+            Log("Enum: \"%s\" VID_%04X&PID_%04X type 0x%lX -> %s%s", name, vid, pid,
+                (unsigned long)*(const DWORD *)(p + DDI_OFS_DEVTYPE),
+                hidden ? "HIDDEN, " : "visible", hidden ? reason : "");
         else
-            Log("Enum: \"%s\" product %s -> visible", name, gs);
+            Log("Enum: \"%s\" product %s type 0x%lX -> %s%s", name, gs,
+                (unsigned long)*(const DWORD *)(p + DDI_OFS_DEVTYPE),
+                hidden ? "HIDDEN, " : "visible", hidden ? reason : "");
     }
 
     if (hidden) return DIENUM_CONTINUE;
@@ -538,7 +581,7 @@ static HRESULT WINAPI Hk_EnumDevices(void *self, DWORD type, void *cb, void *ref
     if (!h) return E_FAIL;
     if (InterlockedIncrement(&calls) <= 20)
         Log("EnumDevices(type 0x%lX, flags 0x%lX)", (unsigned long)type, (unsigned long)flags);
-    if (!cb || g_hiddenCount == 0) return h->oEnumDevices(self, type, cb, ref, flags);
+    if (!cb || (g_hiddenCount == 0 && !g_hideNonGameControllers)) return h->oEnumDevices(self, type, cb, ref, flags);
     ctx.cb = (PFN_EnumCallback)cb;
     ctx.ref = ref;
     ctx.wide = h->wide;
@@ -558,7 +601,7 @@ static HRESULT WINAPI Hk_CreateDevice(void *self, REFGUID rguid, void **out, voi
         return DIERR_DEVICENOTREG;
     }
     hr = h->oCreateDevice(self, rguid, out, outer);
-    if (SUCCEEDED(hr) && out && *out && g_hiddenCount && CreatedDeviceIsHidden(*out, h->wide)) {
+    if (SUCCEEDED(hr) && out && *out && (g_hiddenCount || g_hideNonGameControllers) && CreatedDeviceIsHidden(*out, h->wide)) {
         ((PFN_Release)(*(void ***)*out)[DEVSLOT_RELEASE])(*out);
         *out = NULL;
         GuidToStr(rguid, gs, sizeof(gs));
@@ -585,7 +628,7 @@ static HRESULT WINAPI Hk_CreateDeviceEx(void *self, REFGUID rguid, REFIID riid, 
         return DIERR_DEVICENOTREG;
     }
     hr = h->oCreateDeviceEx(self, rguid, riid, out, outer);
-    if (SUCCEEDED(hr) && out && *out && g_hiddenCount && CreatedDeviceIsHidden(*out, h->wide)) {
+    if (SUCCEEDED(hr) && out && *out && (g_hiddenCount || g_hideNonGameControllers) && CreatedDeviceIsHidden(*out, h->wide)) {
         ((PFN_Release)(*(void ***)*out)[DEVSLOT_RELEASE])(*out);
         *out = NULL;
         GuidToStr(rguid, gs, sizeof(gs));
