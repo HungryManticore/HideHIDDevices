@@ -48,3 +48,7 @@ cl /O2 /LD src\HideHIDDevices.c setupapi.lib /Fe:HideHIDDevices.asi
 ## Limitations
 
 Only DirectInput is filtered. Devices are not hidden from the legacy `winmm` joystick API, Raw Input or XInput.
+
+## AI disclosure
+
+This project was built entirely by Claude.
