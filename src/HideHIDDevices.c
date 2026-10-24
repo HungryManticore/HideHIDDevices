@@ -33,12 +33,13 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#include <tlhelp32.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "setupapi.lib")
 #endif
 
-#define HHD_VERSION "1.2.0"
+#define HHD_VERSION "1.3.0"
 
 /* ------------------------------------------------------------------------- */
 /* DirectInput bits we need (defined locally so no SDK/dxguid is required)    */
@@ -379,11 +380,67 @@ static void LogConnectedHidDevices(void)
     SetupDiDestroyDeviceInfoList(h);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Heap corruption tracking                                                  */
+/* ------------------------------------------------------------------------- */
+
+static volatile DWORD g_heapCheckThread;   /* thread currently in HeapValidate */
+static BOOL g_heapBadReported;
+static DWORD g_mainThread;
+static int  g_heapChecks;
+
+/* Validate every heap in the process and log the first time one is corrupt.
+   Only called on the game's own thread, from inside our hooks. */
+static void CheckHeaps(const char *where)
+{
+    HANDLE heaps[64];
+    DWORD n, i;
+    if (g_heapBadReported || GetCurrentThreadId() != g_mainThread) return;
+    n = GetProcessHeaps(64, heaps);
+    if (n > 64) n = 64;
+    g_heapChecks++;
+    for (i = 0; i < n; i++) {
+        BOOL ok;
+        g_heapCheckThread = GetCurrentThreadId();
+        ok = HeapValidate(heaps[i], 0, NULL);
+        g_heapCheckThread = 0;
+        if (!ok) {
+            g_heapBadReported = TRUE;
+            Log("*** HEAP CORRUPTION detected %s: heap %p (%s) - the previous check was OK",
+                where, heaps[i], heaps[i] == GetProcessHeap() ? "process heap" : "other heap");
+            return;
+        }
+    }
+}
+
+static void LogHeapSummary(const char *where)
+{
+    CheckHeaps(where);
+    if (!g_heapBadReported)
+        Log("Heap check OK %s (%d checks so far)", where, g_heapChecks);
+}
+
+static void LogModules(void)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    MODULEENTRY32 me;
+    if (snap == INVALID_HANDLE_VALUE) return;
+    Log("Loaded modules:");
+    me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) {
+        do {
+            Log("  %08lX %s", (unsigned long)(DWORD_PTR)me.modBaseAddr, me.szExePath);
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
 static void EnsureInit(void)
 {
     if (g_initDone) return;
     EnterCriticalSection(&g_cs);
     if (!g_initDone) {
+        LogHeapSummary("before plugin setup");
         LogConnectedHidDevices();
         LoadIni();
         InterlockedExchange(&g_initDone, 1);
@@ -569,8 +626,13 @@ static BOOL CALLBACK EnumFilter(const void *ddi, void *ref)
                 hidden ? "HIDDEN, " : "visible", hidden ? reason : "");
     }
 
+    CheckHeaps(firstTime ? "while DirectInput enumerated this device" : "during enumeration");
     if (hidden) return DIENUM_CONTINUE;
-    return ctx->cb(ddi, ctx->ref);
+    {
+        BOOL r = ctx->cb(ddi, ctx->ref);
+        CheckHeaps("after the game processed this device");
+        return r;
+    }
 }
 
 static HRESULT WINAPI Hk_EnumDevices(void *self, DWORD type, void *cb, void *ref, DWORD flags)
@@ -585,7 +647,13 @@ static HRESULT WINAPI Hk_EnumDevices(void *self, DWORD type, void *cb, void *ref
     ctx.cb = (PFN_EnumCallback)cb;
     ctx.ref = ref;
     ctx.wide = h->wide;
-    return h->oEnumDevices(self, type, (void *)EnumFilter, &ctx, flags);
+    {
+        HRESULT hr;
+        CheckHeaps("before EnumDevices");
+        hr = h->oEnumDevices(self, type, (void *)EnumFilter, &ctx, flags);
+        LogHeapSummary("after EnumDevices");
+        return hr;
+    }
 }
 
 static HRESULT WINAPI Hk_CreateDevice(void *self, REFGUID rguid, void **out, void *outer)
@@ -600,7 +668,9 @@ static HRESULT WINAPI Hk_CreateDevice(void *self, REFGUID rguid, void **out, voi
         Log("CreateDevice %s blocked (hidden device)", gs);
         return DIERR_DEVICENOTREG;
     }
+    CheckHeaps("before CreateDevice");
     hr = h->oCreateDevice(self, rguid, out, outer);
+    CheckHeaps("inside DirectInput CreateDevice");
     if (SUCCEEDED(hr) && out && *out && (g_hiddenCount || g_hideNonGameControllers) && CreatedDeviceIsHidden(*out, h->wide)) {
         ((PFN_Release)(*(void ***)*out)[DEVSLOT_RELEASE])(*out);
         *out = NULL;
@@ -701,7 +771,13 @@ static HRESULT WINAPI Hk_DirectInputCreateA(HINSTANCE hi, DWORD ver, void **out,
     if (!o_DirectInputCreateA) return E_FAIL;
     EnsureInit();
     Log("DirectInputCreateA(version 0x%04lX)", (unsigned long)ver);
+    LogHeapSummary("before DirectInputCreateA");
     hr = o_DirectInputCreateA(hi, ver, out, outer);
+    LogHeapSummary("after DirectInputCreateA");
+    {
+        static BOOL modsLogged;
+        if (!modsLogged) { modsLogged = TRUE; LogModules(); }
+    }
     if (SUCCEEDED(hr) && out && *out) PatchObject(*out, FALSE, FALSE);
     return hr;
 }
@@ -750,8 +826,16 @@ static HRESULT WINAPI Hk_DirectInput8Create(HINSTANCE hi, DWORD ver, REFIID riid
     return hr;
 }
 
+static void CheckHeaps(const char *where);
+
 static FARPROC WINAPI Hk_GetProcAddress(HMODULE mod, LPCSTR name)
 {
+    if (name && HIWORD((DWORD_PTR)name)) {
+        char where[160];
+        _snprintf(where, sizeof(where), "when the game called GetProcAddress(\"%s\")", name);
+        where[sizeof(where) - 1] = 0;
+        CheckHeaps(where);
+    }
     FARPROC real = o_GetProcAddress ? o_GetProcAddress(mod, name) : GetProcAddress(mod, name);
     if (!real || !name || !HIWORD((DWORD_PTR)name)) return real;
 
@@ -895,6 +979,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
         code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_PRIV_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000374 /* heap corruption */)
         return EXCEPTION_CONTINUE_SEARCH;
+    if (g_heapCheckThread == GetCurrentThreadId()) return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedIncrement(&count) > 5) return EXCEPTION_CONTINUE_SEARCH;
 
     DescribeAddress((DWORD_PTR)er->ExceptionAddress, where, sizeof(where));
@@ -933,6 +1018,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
         }
     }
     Log("    (first-chance; the game may still handle this exception)");
+    CheckHeaps("right after this exception");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -961,7 +1047,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
             MoveFileExA(g_logPath, prev, MOVEFILE_REPLACE_EXISTING);
         }
         Log("HideHIDDevices %s loaded", HHD_VERSION);
+        g_mainThread = GetCurrentThreadId();
         AddVectoredExceptionHandler(1, CrashLogger);
+        LogHeapSummary("at plugin load");
         HookImports(GetModuleHandleA(NULL));
     }
     return TRUE;
