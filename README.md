@@ -1,4 +1,4 @@
-# HideHIDDevices
+# Hide HID Devices
 
 An [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) plugin that hides selected HID devices from DirectInput games.
 
@@ -64,6 +64,9 @@ cl /O2 /LD src\HideHIDDevices.c setupapi.lib /Fe:HideHIDDevices.asi
 ## Limitations
 
 Only DirectInput is filtered. Devices are not hidden from the legacy `winmm` joystick API, Raw Input or XInput.
+
+# Special thanks
+ThirteenAG for the [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
 
 ## AI disclosure
 
